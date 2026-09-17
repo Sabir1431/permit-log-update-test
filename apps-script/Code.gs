@@ -86,6 +86,7 @@ function doGet(ev) {
     if (action === 'list')  return json({ ok: true, rows: listRows((ev.parameter.project) || '') });
     if (action === 'users') return json({ ok: true, users: getUserNames() });
     if (action === 'nextPermitNo') return json(apiNextPermitNo((ev.parameter.project) || ''));
+    if (action === 'permitPhotos') return json(apiPermitPhotos((ev.parameter.folder) || ''));
     if (action)             return json({ ok: false, error: 'Unknown action: ' + action });
     try {
       return HtmlService.createHtmlOutputFromFile(CONFIG.HTML_FILE)
@@ -329,6 +330,36 @@ function savePhotos_(project, permitNo, photos) {
     count++;
   }
   return { folderUrl: dest.getUrl(), count: count };
+}
+
+// Lists the images in a permit's Drive folder as small thumbnails (data URLs),
+// so the app can preview them even though the folder is private (script reads as
+// owner). `folder` may be a folder id or the full folder URL.
+function apiPermitPhotos(folder) {
+  try {
+    if (!folder) return { ok: true, photos: [] };
+    var m = String(folder).match(/[-\w]{25,}/);
+    var id = m ? m[0] : folder;
+    var f = DriveApp.getFolderById(id);
+    var files = f.getFiles();
+    var out = [], count = 0;
+    while (files.hasNext() && count < 40) {
+      var file = files.next();
+      var mt = file.getMimeType() || '';
+      if (mt.indexOf('image/') !== 0) continue;
+      var thumb = '';
+      try {
+        var tb = file.getThumbnail();
+        if (tb) thumb = 'data:' + tb.getContentType() + ';base64,' + Utilities.base64Encode(tb.getBytes());
+      } catch (e) {}
+      out.push({ name: file.getName(), url: file.getUrl(), thumb: thumb });
+      count++;
+    }
+    out.sort(function (a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); });
+    return { ok: true, photos: out };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
 }
 
 function permitNoExists_(sheet, permitNo) {

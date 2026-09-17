@@ -38,6 +38,27 @@ var CONFIG = {
     'TWS O-16124': 'TWS O-16124 Permit Log'
   },
 
+  // Project value -> Google Drive project folder that holds the permit photos.
+  // Photos are stored under  <folder>/logs/Permits/<permit no.>/
+  PROJECT_PHOTO_FOLDERS: {
+    'TWS O-16123': '1T7bHa6lXcpBSdvRsNf1KP1lyemSrlHJJ',
+    'TWS O-16124': '19EkxZBErsRk_zuisjRdRSbDwhfXRSlrf'
+  },
+  PHOTO_SUBPATH: ['logs', 'Permits'],   // subfolders created inside the project folder
+
+  // Permit-number control.
+  //   MODE 'auto'   = the server issues the next number (users can't type one) —
+  //                   guarantees no duplicates and a clean sequence.
+  //   MODE 'manual' = users type the number; duplicates are still REJECTED.
+  // Auto format example: PTW-16123-2026-0001
+  PERMIT_NO: {
+    MODE: 'auto',
+    PREFIX: 'PTW',
+    INCLUDE_PROJECT_CODE: true,   // adds 16123 / 16124 (digits from the project)
+    INCLUDE_YEAR: true,
+    PAD: 4
+  },
+
   HTML_FILE: 'Index'
 };
 
@@ -47,7 +68,7 @@ var COLUMNS = [
   'Date', 'Time', 'Permit No.', 'Permit Type', 'Location', 'Contractor',
   'Supervisor', 'Work Description', 'Hazards', 'Control Measures',
   'Permit Issuer', 'Valid From', 'Valid To', 'Status',
-  'Logged By', 'Logged At', 'Verified'
+  'Logged By', 'Logged At', 'Verified', 'Photos'
 ];
 
 var FIELD_TO_HEADER = {
@@ -64,6 +85,7 @@ function doGet(ev) {
     var action = ev && ev.parameter && ev.parameter.action;
     if (action === 'list')  return json({ ok: true, rows: listRows((ev.parameter.project) || '') });
     if (action === 'users') return json({ ok: true, users: getUserNames() });
+    if (action === 'nextPermitNo') return json(apiNextPermitNo((ev.parameter.project) || ''));
     if (action)             return json({ ok: false, error: 'Unknown action: ' + action });
     try {
       return HtmlService.createHtmlOutputFromFile(CONFIG.HTML_FILE)
@@ -167,6 +189,22 @@ function savePermit_(payload) {
     var sheet = getSheetForProject_(payload.project || '');
     if (!sheet) return { ok: false, error: 'No permit tab configured for project: ' + (payload.project || '(blank)') };
 
+    // Permit number: issue it (auto) or validate it (manual). Inside the lock,
+    // so no two saves can ever produce the same number.
+    var permitNo;
+    if ((CONFIG.PERMIT_NO || {}).MODE === 'auto') {
+      permitNo = nextPermitNo_(payload.project, sheet);
+    } else {
+      permitNo = String(payload.permitNo || '').trim();
+      if (permitNo && permitNoExists_(sheet, permitNo)) {
+        return { ok: false, error: 'DUPLICATE: Permit No. "' + permitNo + '" already exists in ' + (payload.project || '') + '. Use a different number.' };
+      }
+    }
+    payload.permitNo = permitNo;
+
+    // Upload any photos to the project's Drive folder before writing the row.
+    var photoResult = savePhotos_(payload.project, permitNo, payload.photos);
+
     var headers = ensureHeaders(sheet);
     var row = headers.map(function (h) {
       for (var key in FIELD_TO_HEADER) {
@@ -175,11 +213,12 @@ function savePermit_(payload) {
       if (h === 'Logged By') return authName;
       if (h === 'Logged At') return payload.clientLoggedAt || new Date().toISOString();
       if (h === 'Verified')  return 'YES';
+      if (h === 'Photos')    return photoResult.folderUrl;
       return '';
     });
 
     sheet.appendRow(row);
-    return { ok: true, success: true, loggedBy: authName };
+    return { ok: true, success: true, loggedBy: authName, permitNo: permitNo, photos: photoResult.count, photoFolder: photoResult.folderUrl };
   } catch (err) {
     return { ok: false, error: String(err) };
   } finally {
@@ -201,6 +240,108 @@ function getSheetForProject_(project) {
   var tabName = CONFIG.PROJECT_TABS[project];
   if (tabName) return ss.getSheetByName(tabName) || ss.insertSheet(tabName);
   return ss.getSheetByName(project);   // fallback: a tab named exactly like the project
+}
+
+// ======================= PERMIT NUMBERS =======================
+
+function escapeRegex_(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+function permitNoColIndex_(headers) {
+  var c = headers.indexOf('Permit No.');
+  if (c < 0) c = headers.indexOf('Permit No');
+  if (c < 0) c = headers.indexOf('PermitNo');
+  return c;
+}
+
+// The base prefix a new number is built from, e.g. "PTW-16123-2026-".
+function permitNoBase_(project) {
+  var cfg = CONFIG.PERMIT_NO || {};
+  var parts = [cfg.PREFIX || 'PTW'];
+  if (cfg.INCLUDE_PROJECT_CODE) { var code = String(project).replace(/\D/g, ''); if (code) parts.push(code); }
+  if (cfg.INCLUDE_YEAR) parts.push(new Date().getFullYear());
+  return parts.join('-') + '-';
+}
+
+// Next sequential number for a project = highest existing sequence with the same
+// base, + 1. Reads the tab live, so it self-corrects and never repeats.
+function nextPermitNo_(project, sheet) {
+  var cfg = CONFIG.PERMIT_NO || {};
+  var base = permitNoBase_(project);
+  var re = new RegExp('^' + escapeRegex_(base) + '(\\d+)$', 'i');
+  var max = 0;
+  sheet = sheet || getSheetForProject_(project);
+  if (sheet) {
+    var vals = sheet.getDataRange().getValues();
+    if (vals.length) {
+      var col = permitNoColIndex_(vals[0].map(function (h) { return String(h).trim(); }));
+      if (col >= 0) {
+        for (var i = 1; i < vals.length; i++) {
+          var m = re.exec(String(vals[i][col] || '').trim());
+          if (m) { var n = parseInt(m[1], 10); if (n > max) max = n; }
+        }
+      }
+    }
+  }
+  return base + String(max + 1).padStart(cfg.PAD || 4, '0');
+}
+
+// A preview of the next number (used by the form). Real number is assigned on save.
+function apiNextPermitNo(project) {
+  return { ok: true, mode: (CONFIG.PERMIT_NO || {}).MODE || 'manual', permitNo: nextPermitNo_(project || '') };
+}
+
+// ======================= PHOTOS → DRIVE =======================
+
+function ensurePath_(root, parts) {
+  var f = root;
+  for (var i = 0; i < parts.length; i++) {
+    var name = String(parts[i] || '').replace(/[\/\\]/g, '-').trim();
+    if (!name) continue;
+    var it = f.getFoldersByName(name);
+    f = it.hasNext() ? it.next() : f.createFolder(name);
+  }
+  return f;
+}
+
+function dataUrlToBlob_(dataUrl, name) {
+  if (!dataUrl) return null;
+  var m = String(dataUrl).match(/^data:([^;]+);base64,(.*)$/);
+  if (!m) return null;
+  var contentType = m[1];
+  var bytes = Utilities.base64Decode(m[2]);
+  var ext = contentType.indexOf('png') >= 0 ? '.png' : (contentType.indexOf('webp') >= 0 ? '.webp' : '.jpg');
+  return Utilities.newBlob(bytes, contentType, name + ext);
+}
+
+// Saves photos under <projectFolder>/logs/Permits/<permitNo>/ and returns the folder URL.
+function savePhotos_(project, permitNo, photos) {
+  var rootId = (CONFIG.PROJECT_PHOTO_FOLDERS || {})[project];
+  if (!rootId || !photos || !photos.length) return { folderUrl: '', count: 0 };
+  var root = DriveApp.getFolderById(rootId);
+  var parts = (CONFIG.PHOTO_SUBPATH || []).concat([permitNo || ('Permit-' + Date.now())]);
+  var dest = ensurePath_(root, parts);
+  var count = 0;
+  for (var i = 0; i < photos.length; i++) {
+    var blob = dataUrlToBlob_(photos[i].dataUrl, (permitNo || 'permit') + '-' + (i + 1));
+    if (!blob) continue;
+    var file = dest.createFile(blob);
+    if (photos[i].caption) file.setDescription(String(photos[i].caption));
+    count++;
+  }
+  return { folderUrl: dest.getUrl(), count: count };
+}
+
+function permitNoExists_(sheet, permitNo) {
+  if (!permitNo) return false;
+  var vals = sheet.getDataRange().getValues();
+  if (!vals.length) return false;
+  var col = permitNoColIndex_(vals[0].map(function (h) { return String(h).trim(); }));
+  if (col < 0) return false;
+  var target = String(permitNo).trim().toLowerCase();
+  for (var i = 1; i < vals.length; i++) {
+    if (String(vals[i][col] || '').trim().toLowerCase() === target) return true;
+  }
+  return false;
 }
 
 function ensureHeaders(sheet) {

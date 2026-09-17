@@ -40,6 +40,7 @@
       login(login, password) { return SERVED_BY_GAS ? gasCall('apiLogin', { login, password }) : postPayload({ action: 'login', login, password }); },
       users() { return SERVED_BY_GAS ? gasCall('apiUsers') : fetchJson(`${APPS_SCRIPT_URL}?action=users`); },
       list(project) { return SERVED_BY_GAS ? gasCall('apiList', project) : fetchJson(`${APPS_SCRIPT_URL}?action=list&project=${encodeURIComponent(project)}`); },
+      nextPermitNo(project) { return SERVED_BY_GAS ? gasCall('apiNextPermitNo', project) : fetchJson(`${APPS_SCRIPT_URL}?action=nextPermitNo&project=${encodeURIComponent(project)}`); },
       save(payload) { return SERVED_BY_GAS ? gasCall('apiSave', payload) : postPayload(payload); }
     };
 
@@ -66,6 +67,31 @@
     function isSameDay(a, b) { return a.getFullYear()===b.getFullYear() && a.getMonth()===b.getMonth() && a.getDate()===b.getDate(); }
     function daysSince(d) { return Math.floor((Date.now() - d.getTime()) / 86400000); }
     function fmtDate(d) { if (!d) return '—'; const y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,'0'), a=String(d.getDate()).padStart(2,'0'); return `${y}-${m}-${a}`; }
+
+    // Resize/compress an image file to keep uploads small. Returns a JPEG data URL.
+    function compressImage(file, maxDim, quality) {
+      maxDim = maxDim || 1600; quality = quality || 0.7;
+      return new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const img = new Image();
+          img.onload = () => {
+            let w = img.width, h = img.height;
+            if (w > maxDim || h > maxDim) {
+              if (w >= h) { h = Math.round(h * maxDim / w); w = maxDim; }
+              else { w = Math.round(w * maxDim / h); h = maxDim; }
+            }
+            const c = document.createElement('canvas'); c.width = w; c.height = h;
+            c.getContext('2d').drawImage(img, 0, 0, w, h);
+            try { resolve(c.toDataURL('image/jpeg', quality)); } catch { resolve(reader.result); }
+          };
+          img.onerror = () => resolve(reader.result);
+          img.src = reader.result;
+        };
+        reader.onerror = () => resolve('');
+        reader.readAsDataURL(file);
+      });
+    }
 
     // =====================================================================
     //  LOGIN SCREEN
@@ -134,6 +160,10 @@
       const [saving, setSaving] = useState(false);
       const [tab, setTab] = useState('log');
       const [showSettings, setShowSettings] = useState(false);
+      const [nextNo, setNextNo] = useState('');
+      const [permitNoMode, setPermitNoMode] = useState('manual');
+      const [permitNoLoading, setPermitNoLoading] = useState(false);
+      const [photos, setPhotos] = useState([]);
       const formRef = useRef(null);
       const toastTimer = useRef(null);
 
@@ -177,6 +207,19 @@
 
       useEffect(() => { if (auth) { loadFromSheet(project); loadUsers(); } }, [auth, project]);
 
+      // Fetch the next permit number whenever the form is opened / project changes.
+      useEffect(() => {
+        if (!auth || !showForm) return;
+        setPermitNoLoading(true);
+        api.nextPermitNo(project).then(r => {
+          if (r && r.ok) {
+            setPermitNoMode(r.mode || 'manual');
+            setNextNo(r.permitNo || '');
+            if ((r.mode || '') === 'auto') setForm(f => ({ ...f, permitNo: r.permitNo || '' }));
+          }
+        }).catch(() => {}).finally(() => setPermitNoLoading(false));
+      }, [auth, showForm, project]);
+
       function toast(msg) { setNote(msg); if (toastTimer.current) clearTimeout(toastTimer.current); toastTimer.current = setTimeout(() => setNote(''), 3500); }
 
       function logout() { ssClearAuth(); setAuth(null); setPermits([]); setShowForm(false); }
@@ -202,7 +245,8 @@
             status: r['Status'] || 'Active',
             loggedBy: r['Logged By'] || r['LoggedBy'] || r['Recorded By'] || '',
             loggedAt: r['Logged At'] || r['LoggedAt'] || r['Timestamp'] || '',
-            verified: String(r['Verified'] || '').toUpperCase() === 'YES'
+            verified: String(r['Verified'] || '').toUpperCase() === 'YES',
+            photos: r['Photos'] || ''
           }));
           setPermits(list.reverse());
           toast('☁️ Loaded ' + list.length + ' permits');
@@ -213,6 +257,17 @@
       }
 
       function updateForm(name, value) { setForm(f => ({ ...f, [name]: value })); setErrors(s => ({ ...s, [name]: undefined })); }
+
+      async function handlePhotoSelect(ev) {
+        const files = Array.from(ev.target.files || []);
+        if (!files.length) return;
+        toast('🖼️ Processing ' + files.length + ' photo(s)…');
+        const out = [];
+        for (const f of files) { const dataUrl = await compressImage(f); if (dataUrl) out.push({ name: f.name, dataUrl }); }
+        setPhotos(ps => ps.concat(out));
+        ev.target.value = '';
+      }
+      function removePhoto(i) { setPhotos(ps => ps.filter((_, idx) => idx !== i)); }
 
       function validate() {
         const req = ['date', 'time', 'location', 'contractor', 'supervisor'];
@@ -234,6 +289,7 @@
         }
         const payload = {
           project, authLogin: auth.email || auth.name, authPassword: auth.password,
+          photos: photos.map(p => ({ dataUrl: p.dataUrl })),
           clientLoggedAt: new Date().toISOString(),
           date: form.date, time: form.time, permitNo: String(form.permitNo).trim(),
           permitTypeName, location: String(form.location).trim(),
@@ -243,11 +299,11 @@
           validFrom: form.validFrom, validTo: form.validTo, status: form.status
         };
         try {
-          setSaving(true); toast('💾 Saving…');
+          setSaving(true); toast(photos.length ? ('💾 Saving & uploading ' + photos.length + ' photo(s)…') : '💾 Saving…');
           const json = await api.save(payload);
           if (json && json.error && String(json.error).indexOf('AUTH:') === 0) { toast('❌ Session expired — please sign in again'); logout(); return; }
           if (!json || (!json.ok && !json.success)) throw new Error((json && json.error) || 'save failed');
-          toast('✅ Saved — logged by ' + (json.loggedBy || auth.name));
+          toast('✅ Saved ' + (json.permitNo ? '(' + json.permitNo + ') ' : '') + '— logged by ' + (json.loggedBy || auth.name));
           setShowForm(false); resetForm();
           await loadFromSheet(project);
         } catch (err) {
@@ -257,7 +313,7 @@
       }
 
       function resetForm() {
-        setErrors({}); setPermitType('');
+        setErrors({}); setPermitType(''); setPhotos([]);
         setForm({
           date: new Date().toISOString().split('T')[0], time: new Date().toTimeString().slice(0, 5),
           permitNo: '', location: '', contractor: '', supervisor: '',
@@ -373,6 +429,22 @@
 
       const isAdmin = auth.role === 'Admin';
 
+      // Permit No. field — auto-issued (read-only preview) or manual (with live dup check).
+      const dupPermit = permitNoMode !== 'auto' && form.permitNo &&
+        permits.some(p => (p.permitNo || '').trim().toLowerCase() === String(form.permitNo).trim().toLowerCase());
+      const permitNoField = (permitNoMode === 'auto')
+        ? e('div', null,
+            e('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, 'Permit No. (auto-issued)'),
+            e('input', { type: 'text', readOnly: true, value: permitNoLoading ? 'Assigning…' : (nextNo || form.permitNo || ''),
+              className: 'w-full border border-gray-200 bg-gray-50 rounded-lg px-3 py-2 text-gray-600 font-mono' }),
+            e('p', { className: 'text-xs text-gray-400 mt-1' }, '🔒 Issued automatically on save — always unique.'))
+        : e('div', null,
+            e('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, 'Permit No.'),
+            e('input', { name: 'permitNo', type: 'text', value: form.permitNo, onChange: ev => updateForm('permitNo', ev.target.value),
+              className: 'w-full border rounded-lg px-3 py-2 outline-none focus:ring-2 focus:ring-blue-500 ' + (dupPermit ? 'border-amber-400 bg-amber-50' : 'border-gray-300'),
+              autoComplete: 'off', placeholder: nextNo ? ('e.g. ' + nextNo) : '' }),
+            dupPermit && e('p', { className: 'text-xs text-amber-600 mt-1' }, '⚠️ This permit number already exists in this project — it will be rejected.'));
+
       // ---- main UI ----
       return e('div', { className: 'min-h-screen p-4 md:p-6' },
         e('div', { className: 'max-w-7xl mx-auto' },
@@ -453,7 +525,7 @@
                 errors.permitType && e('p', { className: 'text-xs text-red-500 mt-1' }, errors.permitType)),
               labeled('Date *', 'date', textInput('date', { type: 'date' })),
               labeled('Time *', 'time', textInput('time', { type: 'time' })),
-              labeled('Permit No.', 'permitNo', textInput('permitNo')),
+              permitNoField,
               labeled('Location *', 'location', textInput('location')),
               labeled('Contractor *', 'contractor', textInput('contractor')),
               labeled('Supervisor *', 'supervisor', textInput('supervisor')),
@@ -469,6 +541,16 @@
                 e('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, 'Control Measures'),
                 e('textarea', { name: 'controlMeasures', rows: 2, value: form.controlMeasures, onChange: ev => updateForm('controlMeasures', ev.target.value),
                   className: 'w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-blue-500', autoComplete: 'off' })),
+              e('div', { className: 'md:col-span-2' },
+                e('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, '📷 Permit Photos'),
+                e('input', { type: 'file', accept: 'image/*', capture: 'environment', multiple: true, onChange: handlePhotoSelect,
+                  className: 'w-full border border-gray-300 rounded-lg px-3 py-2 text-sm' }),
+                photos.length > 0 && e('div', { className: 'flex flex-wrap gap-2 mt-2' },
+                  photos.map((p, i) => e('div', { key: i, className: 'relative' },
+                    e('img', { src: p.dataUrl, className: 'w-20 h-20 object-cover rounded border border-gray-200' }),
+                    e('button', { type: 'button', onClick: () => removePhoto(i),
+                      className: 'absolute -top-2 -right-2 bg-red-500 text-white rounded-full w-5 h-5 text-xs leading-none' }, '×')))),
+                e('p', { className: 'text-xs text-gray-400 mt-1' }, 'Saved to the project Drive folder → logs / Permits / <permit no.>. Auto-compressed before upload.')),
               labeled('Permit Issuer', 'permitIssuer', textInput('permitIssuer')),
               e('div', null,
                 e('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, 'Status'),
@@ -527,7 +609,9 @@
                           return e('tr', { key: p.id, className: expired ? 'bg-red-50 hover:bg-red-100' : 'hover:bg-gray-50' },
                             e('td', { className: 'px-3 py-3 text-sm text-gray-800 whitespace-nowrap' }, p.date),
                             e('td', { className: 'px-3 py-3 text-sm text-gray-800 whitespace-nowrap' }, p.time),
-                            e('td', { className: 'px-3 py-3 text-sm text-gray-800 whitespace-nowrap' }, p.permitNo || '—'),
+                            e('td', { className: 'px-3 py-3 text-sm text-gray-800 whitespace-nowrap' },
+                              e('span', null, p.permitNo || '—'),
+                              p.photos && e('a', { href: p.photos, target: '_blank', rel: 'noopener', className: 'ml-1 text-blue-600', title: 'Open permit photos in Drive' }, '📎')),
                             e('td', { className: 'px-3 py-3 text-sm' }, e('span', { className: 'inline-block px-2 py-1 bg-blue-100 text-blue-800 rounded text-xs' }, p.permitTypeName)),
                             e('td', { className: 'px-3 py-3 text-sm text-gray-800' }, p.location),
                             e('td', { className: 'px-3 py-3 text-sm text-gray-800' }, p.contractor),

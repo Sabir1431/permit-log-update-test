@@ -30,15 +30,22 @@
 
 // ======================= CONFIG (edit these) =======================
 var CONFIG = {
+  // The Google Sheet this script reads/writes. REQUIRED when the script is
+  // standalone (not created from the sheet via Extensions → Apps Script).
+  // This is the long id from your sheet URL: .../spreadsheets/d/<THIS>/edit
+  SPREADSHEET_ID: '1eqRc318-sQ7qZYMDlmfVCqo7Gu6_Z3HCbaqFDgE3hiI',
+
   MODE: 'SINGLE_TAB',      // 'SINGLE_TAB' (one tab + Project column) or 'TAB_PER_PROJECT'
-  TAB_NAME: 'Permit Log',  // used when MODE === 'SINGLE_TAB'
+  TAB_NAME: 'Permit Log',  // exact tab name for SINGLE_TAB — must match a tab in your sheet
   HTML_FILE: 'Index',      // Apps Script HTML file that holds the page (served build)
 
   // 🔒 ANTI-IMPERSONATION CONTROLS
-  // When true, a permit can ONLY be saved by someone with a real Google session.
-  // This blocks self-declared names AND blocks anyone POSTing a forged name to
-  // the endpoint directly. Turn on once you deploy the verified (Mode A) build.
-  REQUIRE_VERIFIED: true,
+  // When true, a permit can ONLY be saved by someone with a real Google session
+  // (blocks self-declared names AND forged direct POSTs). Leave this FALSE until
+  // you've confirmed your loggers actually get a verified email (green banner in
+  // the app). If you switch it to true before that, NO ONE can save. The email
+  // is still captured and marked Verified=YES whenever a Google session exists.
+  REQUIRE_VERIFIED: false,
 
   // Optional approved-loggers allow-list (lowercase emails). Leave EMPTY to allow
   // any signed-in user on your domain. Add emails to restrict logging to named
@@ -172,13 +179,23 @@ function savePermit_(payload) {
   }
 }
 
-function getSheet(project) {
+// Opens the target spreadsheet whether the script is bound to it or standalone.
+function getSpreadsheet_() {
+  if (CONFIG.SPREADSHEET_ID) return SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   var ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) throw new Error('No spreadsheet: set CONFIG.SPREADSHEET_ID (this script is not bound to a sheet).');
+  return ss;
+}
+
+function getSheet(project) {
+  var ss = getSpreadsheet_();
   var sheet;
   if (CONFIG.MODE === 'TAB_PER_PROJECT') {
     sheet = ss.getSheetByName(project) || ss.insertSheet(project);
   } else {
-    sheet = ss.getSheetByName(CONFIG.TAB_NAME) || ss.insertSheet(CONFIG.TAB_NAME);
+    // Prefer the named tab; if it doesn't exist, fall back to the first/only tab
+    // (so an existing single-tab sheet with any name still works) before creating one.
+    sheet = ss.getSheetByName(CONFIG.TAB_NAME) || ss.getSheets()[0] || ss.insertSheet(CONFIG.TAB_NAME);
   }
   return sheet;
 }
@@ -204,10 +221,10 @@ function ensureHeaders(sheet) {
 }
 
 function listRows(project) {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSpreadsheet_();
   var sheet = (CONFIG.MODE === 'TAB_PER_PROJECT')
     ? ss.getSheetByName(project)
-    : ss.getSheetByName(CONFIG.TAB_NAME);
+    : (ss.getSheetByName(CONFIG.TAB_NAME) || ss.getSheets()[0]);
   if (!sheet) return [];
 
   var values = sheet.getDataRange().getValues();
